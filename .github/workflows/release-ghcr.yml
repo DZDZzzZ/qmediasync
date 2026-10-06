@@ -1,0 +1,44 @@
+name: release-ghcr
+
+on:
+  push:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR 命名空间必须小写，DZDZzzZ 这类含大写的用户名会导致 push 失败
+      - name: Get lowercase repo owner
+        id: owner
+        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 目前只构建 linux/amd64（NAS 常见架构）；如需 arm64 可自行追加 platforms，
+      # 但需先确认基础镜像 qicfan/qms-build-base:latest 有对应架构
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ steps.owner.outputs.name }}/qmediasync:latest
+            ghcr.io/${{ steps.owner.outputs.name }}/qmediasync:${{ github.sha }}
