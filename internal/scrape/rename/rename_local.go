@@ -376,9 +376,10 @@ func (r *RenameLocal) RemoveMediaSourcePath(mediaFile *models.ScrapeMediaFile, s
 	}
 	// 如果有电视剧文件夹，则删除
 	if mediaFile.PathId != "" {
-		// 检查电视剧文件夹的父目录是否是来源根路径
+		// 检查电视剧文件夹的父目录是否是来源根路径（本地存储 TvshowPathId 存的是路径，需与 SourcePath 比对；
+		// 原来与 SourcePathId 比对恒为 false，保护形同虚设）
 		tvshowParentId := mediaFile.TvshowPathId
-		if tvshowParentId == sp.SourcePathId {
+		if helpers.PathEqual(tvshowParentId, sp.SourcePath) || tvshowParentId == sp.SourcePathId {
 			helpers.AppLogger.Info("电视剧的父目录是来源根路径，不删除")
 			return nil
 		}

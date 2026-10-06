@@ -405,7 +405,10 @@ func (r *Rename115) RemoveMediaSourcePath(mediaFile *models.ScrapeMediaFile, sp 
 		sourcePath = mediaFile.TvshowPath
 		hasSeason = false
 	}
-	if sourcePathId == mediaFile.SourcePathId {
+	// 来源根路径保护：ID 和路径双重比对。
+	// 只比 ID 不可靠——记录里的 SourcePathId 是扫描时写入的，若配置后来被改过（例如根目录被删后重建、
+	// 用户重新选择目录导致 cid 变化），旧记录的 ID 与当前配置不一致，保护会失效导致根目录被误删
+	if sourcePathId == mediaFile.SourcePathId || sourcePathId == sp.SourcePathId || helpers.PathEqual(sourcePath, sp.SourcePath) {
 		helpers.AppLogger.Warnf("视频文件 %s 所在目录 %s 是来源根路径，不删除", mediaFile.Path, sourcePath)
 		return nil
 	}
@@ -443,7 +446,8 @@ func (r *Rename115) RemoveMediaSourcePath(mediaFile *models.ScrapeMediaFile, sp 
 	}
 	// 再删除电视剧文件夹
 	if mediaFile.PathId != "" {
-		if mediaFile.TvshowPathId == sp.SourcePathId {
+		// 同样做 ID+路径双重保护，防止记录的目录 ID 与配置不一致时误删来源根目录
+		if mediaFile.TvshowPathId == sp.SourcePathId || mediaFile.TvshowPathId == mediaFile.SourcePathId || helpers.PathEqual(mediaFile.TvshowPath, sp.SourcePath) {
 			helpers.AppLogger.Infof("电视剧目录 %s 是来源根路径，不删除", mediaFile.TvshowPath)
 			return nil
 		}

@@ -31,6 +31,17 @@ func PathExists(path string) bool {
 	return err == nil || os.IsExist(err)
 }
 
+// PathEqual 判断两个路径字符串是否指向同一位置（统一分隔符、去尾部斜杠后比较）。
+// 任一边为空字符串时返回 false，避免空路径被误判为相等。
+func PathEqual(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	na := strings.TrimRight(filepath.ToSlash(a), "/")
+	nb := strings.TrimRight(filepath.ToSlash(b), "/")
+	return na == nb
+}
+
 // 复制文件
 func CopyFile(src, dst string) error {
 	if PathExists(dst) {

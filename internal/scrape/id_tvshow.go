@@ -108,7 +108,9 @@ func (i *IdTvShowImpl) extractInfo(mediaFile *models.ScrapeMediaFile) (*helpers.
 // AI提取
 func (i *IdTvShowImpl) extractInfoByAI(mediaFile *models.ScrapeMediaFile) (*helpers.MediaInfo, error) {
 	client := models.GlobalScrapeSettings.GetAiClient()
-	info, err := client.TakeMoiveName(mediaFile.VideoFilename, i.scrapePath.GetAiPrompt())
+	// 先应用名称替换规则再交给 AI 提取，替换文本中的中文名和 {tmdbid-xxx} 能提高 AI 提取准确率
+	aiFilename := i.scrapePath.ApplyReplaceKeywords(mediaFile.VideoFilename)
+	info, err := client.TakeMoiveName(aiFilename, i.scrapePath.GetAiPrompt())
 	if err != nil {
 		helpers.AppLogger.Errorf("强制使用AI从文件名中提取媒体信息失败: %v", err)
 		return nil, err
@@ -130,6 +132,7 @@ func (i *IdTvShowImpl) extractInfoByAI(mediaFile *models.ScrapeMediaFile) (*help
 		}
 	}
 	folderName := filepath.Base(mediaFile.TvshowPath)
+	folderName = i.scrapePath.ApplyReplaceKeywords(folderName)
 	// 从文件夹中提取信息
 	helpers.AppLogger.Warnf("AI从文件名中提取媒体信息不全，继续从文件夹中补齐信息，文件名 %s， 提取结果 %+v", mediaFile.VideoFilename, info)
 	folderInfo, err := client.TakeMoiveName(folderName, i.scrapePath.GetAiPrompt())
@@ -247,6 +250,9 @@ func (i *IdTvShowImpl) extractInfoByRE(mediaFile *models.ScrapeMediaFile) (*help
 func (i *IdTvShowImpl) extractInfoByREV2(mediaFile *models.ScrapeMediaFile) (*helpers.MediaInfo, error) {
 	folderName := filepath.Base(mediaFile.TvshowPath)
 	filename := filepath.Base(mediaFile.VideoFilename)
+	// 应用用户配置的名称替换规则（例如 One Piece -> 航海王{tmdbid-37854}），替换后的 {tmdbid-xxx} 会被下面的提取逻辑识别
+	filename = i.scrapePath.ApplyReplaceKeywords(filename)
+	folderName = i.scrapePath.ApplyReplaceKeywords(folderName)
 	// 从文件名中获取媒体信息
 	info := helpers.ExtractMediaInfoRe(filename, false, false, i.scrapePath.VideoExtList, i.scrapePath.DeleteKeyword...)
 	helpers.AppLogger.Infof("正则从文件名中提取信息，文件名 %s， 提取结果 %+v", filename, info)

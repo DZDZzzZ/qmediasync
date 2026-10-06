@@ -304,6 +304,14 @@ func InitCron() {
 		// helpers.AppLogger.Info("启动刮削回滚任务")
 		StartScrapeRollbackCron()
 	})
+	GlobalCron.AddFunc("*/5 * * * *", func() {
+		// 每5分钟检查一次到达检查时间的RSS订阅
+		CheckDueRssSubscriptions()
+	})
+	GlobalCron.AddFunc("*/2 * * * *", func() {
+		// 每2分钟轮询一次RSS离线下载进度，完成后触发整理
+		PollPendingRssRecords()
+	})
 	GlobalCron.AddFunc("0 * * * *", func() {
 		// 每小时清理一次请求统计数据，只保留最近24小时
 		if err := models.CleanOldRequestStatsByHours(24); err != nil {

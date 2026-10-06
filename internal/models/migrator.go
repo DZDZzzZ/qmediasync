@@ -18,7 +18,7 @@ type Migrator struct {
 	VersionCode int `json:"version_code"` // 版本号
 }
 
-var MaxVersionCode = 38
+var MaxVersionCode = 39
 var AllTables = []any{
 	BackupConfig{}, BackupRecord{},
 	ApiKey{}, Settings{}, Sync{}, User{}, Account{},
@@ -28,6 +28,7 @@ var AllTables = []any{
 	RequestStat{}, EmbyConfig{}, EmbyMediaItem{}, EmbyMediaSyncFile{}, EmbyLibrary{}, EmbyLibrarySyncPath{},
 	DbDownloadTask{}, DbUploadTask{}, NotificationChannel{}, TelegramChannelConfig{}, MeoWChannelConfig{}, BarkChannelConfig{},
 	ServerChanChannelConfig{}, CustomWebhookChannelConfig{}, NotificationRule{},
+	RssSubscription{}, RssDownloadRecord{},
 }
 
 func (*Migrator) TableName() string {
@@ -467,6 +468,12 @@ func Migrate() {
 		// 添加刮削失败通知类型到emby_config表
 		addNewNotificationRulesForExistingChannels(db.Db)
 		helpers.AppLogger.Info("已添加刮削整理失败通知类型")
+		migrator.UpdateVersionCode(db.Db)
+	}
+	if migrator.VersionCode == 39 {
+		// ScrapePath 增加名称替换规则字段（replaced_keywords），新增 RSS 订阅相关表
+		db.Db.AutoMigrate(ScrapePath{}, RssSubscription{}, RssDownloadRecord{})
+		helpers.AppLogger.Info("已添加名称替换规则字段与RSS订阅表")
 		migrator.UpdateVersionCode(db.Db)
 	}
 	helpers.AppLogger.Infof("当前数据库版本 %d", migrator.VersionCode)

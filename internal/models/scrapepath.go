@@ -83,6 +83,8 @@ type ScrapePath struct {
 	FileNameTemplate      string                       `json:"file_name_template" form:"file_name_template"`             // 文件名称模板，支持{{title}}、{{year}}、{{season}}、{{episode}}
 	DeletedKeyword        string                       `json:"-" form:"-"`                                               // 要删除的关键词，json字符串数组，识别时会将数组中包含的关键字全部替换为空字符串
 	DeleteKeyword         []string                     `json:"delete_keyword" form:"delete_keyword" gorm:"-"`            // 要删除的关键词，字符串数组，识别时会将数组中包含的关键字全部替换为空字符串
+	ReplacedKeywords      string                       `json:"-" form:"-"`                                               // 名称替换规则，json字符串数组，元素为 {"from":"One Piece","to":"航海王{tmdbid-37854}"}，识别前按规则替换作品名
+	ReplaceKeywords       []ReplaceKeywordRule         `json:"replace_keywords" form:"replace_keywords" gorm:"-"`        // 名称替换规则列表，识别前将作品名中的 from 片段替换为 to（to 可包含 {tmdbid-xxx} 标记直接指定TMDB）
 	EnableCategory        bool                         `json:"enable_category" form:"enable_category"`                   // 是否启用分类，开启时会根据分类名称创建文件夹
 	VideoExt              string                       `json:"-" form:"-"`                                               // 视频文件扩展名，json字符串数组，例如："[\"mp4\",\"mkv\",\"avi\"]"
 	VideoExtList          []string                     `json:"video_ext_list" form:"video_ext_list" gorm:"-"`            // 视频文件扩展名列表，字符串数组，例如：["mp4","mkv","avi"]
@@ -119,6 +121,33 @@ type ScrapeStrmPath struct {
 	BaseModel
 	ScrapePathID uint `json:"scrape_path_id" form:"scrape_path_id" gorm:"uniqueIndex:scrape_path_id_strm_path_id"` // 刮削目录ID
 	StrmPathID   uint `json:"strm_path_id" form:"strm_path_id" gorm:"uniqueIndex:scrape_path_id_strm_path_id"`     // 同步目录ID
+}
+
+// ReplaceKeywordRule 名称替换规则：识别前将作品名中的 From 片段替换为 To。
+// To 支持 {tmdbid-xxx} 标记，替换后识别流程会提取该标记直接按指定 TMDB ID 刮削，
+// 例如 From="One Piece", To="航海王{tmdbid-37854}"。
+type ReplaceKeywordRule struct {
+	From string `json:"from" form:"from"`
+	To   string `json:"to" form:"to"`
+}
+
+// ApplyReplaceKeywords 按替换规则改写名称（用于识别前处理文件名/文件夹名）。
+// 规则按配置顺序依次应用，空规则或未配置时原样返回。
+func (sp *ScrapePath) ApplyReplaceKeywords(name string) string {
+	if name == "" || len(sp.ReplaceKeywords) == 0 {
+		return name
+	}
+	result := name
+	for _, rule := range sp.ReplaceKeywords {
+		if rule.From == "" || rule.From == rule.To {
+			continue
+		}
+		if strings.Contains(result, rule.From) {
+			helpers.AppLogger.Infof("名称替换规则命中: %s => %s (%s -> %s)", name, strings.ReplaceAll(result, rule.From, rule.To), rule.From, rule.To)
+			result = strings.ReplaceAll(result, rule.From, rule.To)
+		}
+	}
+	return result
 }
 
 func (sp *ScrapePath) IsRunning() bool {
@@ -170,6 +199,17 @@ func (m *ScrapePath) Save() error {
 		m.DeletedKeyword = string(keyword)
 	} else {
 		m.DeletedKeyword = ""
+	}
+	// 转换名称替换规则列表为json字符串
+	if len(m.ReplaceKeywords) > 0 {
+		rules, err := json.Marshal(m.ReplaceKeywords)
+		if err != nil {
+			helpers.AppLogger.Errorf("转换名称替换规则列表失败: %v", err)
+			return err
+		}
+		m.ReplacedKeywords = string(rules)
+	} else {
+		m.ReplacedKeywords = ""
 	}
 
 	// 处理 cron 相关字段
@@ -229,6 +269,7 @@ func (m *ScrapePath) Save() error {
 			"file_name_template":       m.FileNameTemplate,
 			"folder_name_template":     m.FolderNameTemplate,
 			"deleted_keyword":          m.DeletedKeyword,
+		"replaced_keywords":        m.ReplacedKeywords,
 			"enable_category":          m.EnableCategory,
 			"video_ext":                m.VideoExt,
 			"min_video_file_size":      m.MinVideoFileSize,
@@ -940,6 +981,15 @@ func (sp *ScrapePath) Decode() error {
 	} else {
 		sp.DeleteKeyword = []string{}
 	}
+	// 解码名称替换规则
+	if sp.ReplacedKeywords != "" {
+		err := json.Unmarshal([]byte(sp.ReplacedKeywords), &sp.ReplaceKeywords)
+		if err != nil {
+			return fmt.Errorf("转换名称替换规则列表失败: %v", err)
+		}
+	} else {
+		sp.ReplaceKeywords = []ReplaceKeywordRule{}
+	}
 	return nil
 }
 
@@ -979,6 +1029,15 @@ func GetScrapePathes(sourceType string) []*ScrapePath {
 			} else {
 				scrapePath.DeleteKeyword = []string{}
 			}
+			// 将replaced_keywords转为规则数组
+			if scrapePath.ReplacedKeywords != "" {
+				err := json.Unmarshal([]byte(scrapePath.ReplacedKeywords), &scrapePath.ReplaceKeywords)
+				if err != nil {
+					helpers.AppLogger.Errorf("转换名称替换规则列表失败: %v", err)
+				}
+			} else {
+				scrapePath.ReplaceKeywords = []ReplaceKeywordRule{}
+			}
 		}
 	}
 	return scrapePathes
@@ -1006,6 +1065,15 @@ func GetScrapePathByID(id uint) *ScrapePath {
 			}
 		} else {
 			scrapePath.DeleteKeyword = []string{}
+		}
+		// 将replaced_keywords转为规则数组
+		if scrapePath.ReplacedKeywords != "" {
+			err := json.Unmarshal([]byte(scrapePath.ReplacedKeywords), &scrapePath.ReplaceKeywords)
+			if err != nil {
+				helpers.AppLogger.Errorf("转换名称替换规则列表失败: %v", err)
+			}
+		} else {
+			scrapePath.ReplaceKeywords = []ReplaceKeywordRule{}
 		}
 
 	}
