@@ -798,6 +798,12 @@ func (sm *ScrapeMediaFile) GenerateNameByTemplate(template string) string {
 
 // 使用指定的名字和年份重新刮削
 func (sm *ScrapeMediaFile) ReScrape(name string, year int, tmdbId int64, season int, episode int) error {
+	oldStatus := sm.Status
+	// 已刮削状态的记录在覆盖任何字段之前，先删除按旧识别结果下载的刮削临时文件（nfo、图片等），
+	// 否则重新刮削后新旧元数据并存，整理时错误的旧文件会被一起搬走
+	if oldStatus == ScrapeMediaStatusScraped && sm.NewPathName != "" {
+		sm.removeScrapedTmpFiles()
+	}
 	sm.TmdbId = tmdbId
 	sm.Name = name
 	sm.Year = year
@@ -861,9 +867,7 @@ func (sm *ScrapeMediaFile) ReScrape(name string, year int, tmdbId int64, season 
 			}
 		}
 	}
-	oldStatus := sm.Status
-
-	if oldStatus == ScrapeMediaStatusScrapeFailed || oldStatus == ScrapeMediaStatusScanned {
+	if oldStatus == ScrapeMediaStatusScrapeFailed || oldStatus == ScrapeMediaStatusScanned || oldStatus == ScrapeMediaStatusScraped {
 		mediaId := sm.MediaId
 		if sm.MediaType == MediaTypeTvShow {
 			// 将所有关联的ScrapeMediaFile设置为未刮削
@@ -878,11 +882,21 @@ func (sm *ScrapeMediaFile) ReScrape(name string, year int, tmdbId int64, season 
 			updateData["media_episode_id"] = 0
 			updateData["failed_reason"] = ""
 			updateData["media_id"] = 0
+			// 清空按旧识别结果计算的派生字段，重新刮削时会按新结果重算
+			updateData["category_name"] = ""
+			updateData["scrape_path_category_id"] = 0
+			updateData["new_path_name"] = ""
+			updateData["new_season_path_name"] = ""
+			updateData["new_path_id"] = ""
+			updateData["new_season_path_id"] = ""
+			updateData["new_video_base_name"] = ""
 			db.Db.Where("id = ?", mediaId).Delete(&Media{})
 			db.Db.Where("media_id = ?", mediaId).Delete(&MediaSeason{})
 			db.Db.Where("media_id = ?", mediaId).Delete(&MediaEpisode{})
-			// if sm.PathId == "" {
-			edb := db.Db.Model(&ScrapeMediaFile{}).Where("tvshow_path_id = ? and batch_no = ?", sm.TvshowPathId, sm.BatchNo).Updates(updateData)
+			// 只重置未完成整理的集，已整理（renamed/renaming）的集不能动，否则文件已移走记录却被重置会丢数据
+			edb := db.Db.Model(&ScrapeMediaFile{}).Where("tvshow_path_id = ? and batch_no = ?", sm.TvshowPathId, sm.BatchNo).
+				Where("status IN ?", []ScrapeMediaStatus{ScrapeMediaStatusScanned, ScrapeMediaStatusScrapeFailed, ScrapeMediaStatusScraped}).
+				Updates(updateData)
 			if err := edb.Error; err != nil {
 				helpers.AppLogger.Errorf("重新刮削时更新电视剧内所有剧集失败: %v", err)
 				return err
@@ -901,6 +915,13 @@ func (sm *ScrapeMediaFile) ReScrape(name string, year int, tmdbId int64, season 
 				sm.MediaSeasonId = 0
 				sm.MediaEpisodeId = 0
 				sm.FailedReason = ""
+				sm.CategoryName = ""
+				sm.ScrapePathCategoryId = 0
+				sm.NewPathName = ""
+				sm.NewSeasonPathName = ""
+				sm.NewPathId = ""
+				sm.NewSeasonPathId = ""
+				sm.NewVideoBaseName = ""
 			}
 			hasEdit := false
 			// 检查输入的季是否存在
@@ -937,6 +958,14 @@ func (sm *ScrapeMediaFile) ReScrape(name string, year int, tmdbId int64, season 
 			sm.Status = ScrapeMediaStatusScanned
 			sm.FailedReason = ""
 			sm.MediaId = 0
+			// 清空按旧识别结果计算的派生字段，重新刮削时会按新结果重算
+			sm.CategoryName = ""
+			sm.ScrapePathCategoryId = 0
+			sm.NewPathName = ""
+			sm.NewSeasonPathName = ""
+			sm.NewPathId = ""
+			sm.NewSeasonPathId = ""
+			sm.NewVideoBaseName = ""
 			db.Db.Where("id = ?", mediaId).Delete(&Media{})
 			sm.Save()
 		}
@@ -966,6 +995,37 @@ func (sm *ScrapeMediaFile) ReScrape(name string, year int, tmdbId int64, season 
 		}
 	}
 	return nil
+}
+
+// 删除按旧识别结果生成的刮削临时文件目录（电影删影片目录，电视剧删整剧目录，同批次的集共享该目录）
+// 仅在重新刮削已刮削（scraped）状态的记录时调用，调用时必须保证 NewPathName 等字段仍为旧值
+func (sm *ScrapeMediaFile) removeScrapedTmpFiles() {
+	sp := GetScrapePathByID(sm.ScrapePathId)
+	if sp == nil {
+		helpers.AppLogger.Errorf("重新刮削时获取刮削路径失败: id=%d", sm.ScrapePathId)
+		return
+	}
+	sp.Init()
+	sm.ScrapeRootPath = sp.ScrapeRootPath
+	if sm.ScrapeRootPath == "" {
+		return
+	}
+	var tmpPath string
+	if sm.MediaType == MediaTypeTvShow {
+		tmpPath = sm.GetTmpFullTvshowPath()
+	} else {
+		tmpPath = sm.GetTmpFullMoviePath()
+	}
+	// 安全防护：待删目录必须严格位于刮削临时根目录之内，避免误删源目录或目标目录的文件
+	if tmpPath == "" || tmpPath == sm.ScrapeRootPath || !strings.HasPrefix(tmpPath, sm.ScrapeRootPath+string(os.PathSeparator)) {
+		helpers.AppLogger.Errorf("重新刮削时计算出的刮削临时目录 %s 不合法，跳过删除", tmpPath)
+		return
+	}
+	if err := os.RemoveAll(tmpPath); err != nil {
+		helpers.AppLogger.Errorf("重新刮削时删除旧的刮削临时目录 %s 失败: %v", tmpPath, err)
+	} else {
+		helpers.AppLogger.Infof("重新刮削时删除旧的刮削临时目录 %s 成功", tmpPath)
+	}
 }
 
 func (sm *ScrapeMediaFile) ExtractSeasonEpisode(sp *ScrapePath) error {

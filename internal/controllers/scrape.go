@@ -950,10 +950,12 @@ func ExportScrapeRecords(c *gin.Context) {
 // @Security ApiKeyAuth
 func ReScrape(c *gin.Context) {
 	type reScrapeReq struct {
-		ID      uint  `json:"id"`
-		TmdbId  int64 `json:"tmdb_id"`
-		Season  int   `json:"season"`
-		Episode int   `json:"episode"`
+		ID      uint   `json:"id"`
+		Name    string `json:"name"`
+		Year    int    `json:"year"`
+		TmdbId  int64  `json:"tmdb_id"`
+		Season  int    `json:"season"`
+		Episode int    `json:"episode"`
 	}
 	var req reScrapeReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -972,7 +974,7 @@ func ReScrape(c *gin.Context) {
 		return
 	}
 	oldStatus := scrapeMedia.Status
-	err := scrapeMedia.ReScrape("", 0, req.TmdbId, req.Season, req.Episode)
+	err := scrapeMedia.ReScrape(req.Name, req.Year, req.TmdbId, req.Season, req.Episode)
 	if err != nil {
 		c.JSON(http.StatusOK, APIResponse[any]{Code: BadRequest, Message: "重新刮削失败: " + err.Error(), Data: nil})
 		return
