@@ -971,7 +971,10 @@ func (sm *ScrapeMediaFile) ReScrape(name string, year int, tmdbId int64, season 
 		}
 	}
 	if oldStatus == ScrapeMediaStatusRenamed {
+		// 必须更新 re_scrape_time：MarkStuckRollbackRecords 用它判断回滚是否卡住，
+		// 不更新的话旧时间戳会立刻被兜底判为超时，回滚刚发起就被标记失败
 		sm.Status = ScrapeMediaStatusRollbacking
+		sm.ReScrapeTime = time.Now().Unix()
 		sm.Save()
 		if sm.MediaType == MediaTypeTvShow {
 			// 将所有关联的ScrapeMediaFile设置为回滚中
@@ -981,6 +984,7 @@ func (sm *ScrapeMediaFile) ReScrape(name string, year int, tmdbId int64, season 
 			updateData["tmdb_id"] = sm.TmdbId
 			updateData["status"] = ScrapeMediaStatusRollbacking
 			updateData["failed_reason"] = ""
+			updateData["re_scrape_time"] = sm.ReScrapeTime
 			if sm.TvshowPathId != "" {
 				if err := db.Db.Model(&ScrapeMediaFile{}).Where("tvshow_path_id = ? and batch_no = ?", sm.TvshowPathId, sm.BatchNo).Updates(updateData).Error; err != nil {
 					helpers.AppLogger.Errorf("重新刮削时更新电视剧内其他剧集失败1: %v", err)
