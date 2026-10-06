@@ -1028,6 +1028,31 @@ func (sm *ScrapeMediaFile) removeScrapedTmpFiles() {
 	}
 }
 
+// 回滚卡住的兜底阈值：重新识别后超过这么久仍停在 rollbacking，就强制落到失败态
+const RollbackStuckTimeoutSeconds int64 = 30 * 60
+
+// 把长时间卡在 rollbacking 的记录标记为整理失败。
+// 上游剧集回滚实现曾是空壳（Rollback 直接 return nil），使这类记录被回滚定时任务
+// 每 10 秒重复捞取一次、永远不收敛，日志刷屏且记录卡在"回滚中"。
+// 用 ReScrapeTime 作为判据：它正是发起回滚的时间戳，卡住时必然是旧值。
+func MarkStuckRollbackRecords(timeoutSeconds int64) {
+	deadline := time.Now().Unix() - timeoutSeconds
+	var stuck []*ScrapeMediaFile
+	if err := db.Db.Where("status = ? and re_scrape_time > 0 and re_scrape_time < ?",
+		ScrapeMediaStatusRollbacking, deadline).Find(&stuck).Error; err != nil {
+		helpers.AppLogger.Errorf("查询卡住的回滚记录失败: %v", err)
+		return
+	}
+	for _, sm := range stuck {
+		helpers.AppLogger.Errorf("回滚超时(%d秒未完成)，记录 %s (id=%d) 已标记为整理失败", timeoutSeconds, sm.Name, sm.ID)
+		sm.Status = ScrapeMediaStatusRenameFailed
+		sm.FailedReason = "回滚超时未完成，可能是回滚任务异常，请检查日志或手动重试"
+		if err := sm.Save(); err != nil {
+			helpers.AppLogger.Errorf("标记卡住的回滚记录为失败出错 %s: %v", sm.Name, err)
+		}
+	}
+}
+
 func (sm *ScrapeMediaFile) ExtractSeasonEpisode(sp *ScrapePath) error {
 	if sm.EpisodeNumber == -1 {
 		// 先识别季集

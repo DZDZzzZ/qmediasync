@@ -1,0 +1,19 @@
+# 以官方镜像为基础，仅替换二进制。
+# 基础镜像本机已存在（docker.1ms.run 是国内加速站），构建全程零联网。
+FROM docker.1ms.run/qicfan/qmediasync:latest
+
+# 替换编译好的后端二进制
+COPY QMediaSync /app/QMediaSync
+RUN chmod +x /app/QMediaSync
+
+# 替换前端静态资源：vite 产物带哈希文件名，必须整目录覆盖。
+# 先删掉旧的 assets 避免旧哈希文件残留（占空间且可能被浏览器缓存到）。
+RUN rm -rf /app/web_statics
+COPY web_statics /app/web_statics
+
+# 脚本（容器内热更新机制依赖）
+COPY scripts /app/scripts
+RUN chmod +x /app/scripts/*.sh 2>/dev/null || true
+
+LABEL org.opencontainers.image.title="QMediaSync (dzdzzz build)"
+LABEL org.opencontainers.image.version="v0.14.23-dzdzzz-v3"

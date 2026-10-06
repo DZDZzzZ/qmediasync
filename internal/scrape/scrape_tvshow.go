@@ -678,41 +678,37 @@ func (t *tvShowScrapeImpl) RenamedFailedAllEdpisode(mediaFile *models.ScrapeMedi
 
 // 检查剧和季是否已回滚，没有的话先回滚剧和季
 // 回滚集
+// 注意：上游此函数曾是 `return nil` 的空壳（整个实现被注释掉），导致回滚定时任务
+// 每10 秒重复捞起同一条记录、打印"成功回滚"却什么都不做，形成死循环。
+// 下面恢复对三个真实实现的调用；缺失的 Media/MediaSeason/MediaEpisode 关系按"跳过该层"处理，
+// 而不是直接报错，避免个别集元数据不全时整条回滚卡死。
 func (t *tvShowScrapeImpl) Rollback(mediaFile *models.ScrapeMediaFile) error {
-	return nil
-	// mediaFile.QueryRelation()
-	// if mediaFile.Media == nil {
-	// 	helpers.AppLogger.Errorf("电视剧 %s 不存在", mediaFile.Name)
-	// 	return fmt.Errorf("电视剧 %s 不存在", mediaFile.Name)
-	// }
-	// if mediaFile.MediaSeason == nil {
-	// 	helpers.AppLogger.Errorf("电视剧 %s 季 %d 不存在", mediaFile.Name, mediaFile.SeasonNumber)
-	// 	return fmt.Errorf("电视剧 %s 季 %d 不存在", mediaFile.Name, mediaFile.SeasonNumber)
-	// }
-	// if mediaFile.MediaEpisode == nil {
-	// 	helpers.AppLogger.Errorf("电视剧 %s 季 %d 集 %d 不存在", mediaFile.Name, mediaFile.SeasonNumber, mediaFile.EpisodeNumber)
-	// 	return fmt.Errorf("电视剧 %s 季 %d 集 %d 不存在", mediaFile.Name, mediaFile.SeasonNumber, mediaFile.EpisodeNumber)
-	// }
-	// if mediaFile.Media.Status != models.MediaStatusUnScraped {
-	// 	// 电视剧未回滚，处理电视剧
-	// 	err := t.RollbackTvShow(mediaFile)
-	// 	if err != nil {
-	// 		helpers.AppLogger.Errorf("回滚电视剧 %s 失败, 失败原因: %v", mediaFile.Name, err)
-	// 		return err
-	// 	}
-	// 	helpers.AppLogger.Infof("回滚电视剧 %s 成功", mediaFile.Name)
-	// }
-	// if mediaFile.MediaSeason.Status != models.MediaStatusUnScraped {
-	// 	// 季未回滚，处理季
-	// 	err := t.RollbackTvShowSeason(mediaFile)
-	// 	if err != nil {
-	// 		helpers.AppLogger.Errorf("回滚电视剧 %s 季 %d 失败, 失败原因: %v", mediaFile.Name, mediaFile.SeasonNumber, err)
-	// 		return err
-	// 	}
-	// 	helpers.AppLogger.Infof("回滚电视剧 %s 季 %d 成功", mediaFile.Name, mediaFile.SeasonNumber)
-	// }
-	// // 回滚集
-	// return t.RollbackEpisode(mediaFile)
+	mediaFile.QueryRelation()
+
+	if mediaFile.Media != nil && mediaFile.Media.Status != models.MediaStatusUnScraped {
+		if err := t.RollbackTvShow(mediaFile); err != nil {
+			helpers.AppLogger.Errorf("回滚电视剧 %s 失败, 失败原因: %v", mediaFile.Name, err)
+			return err
+		}
+		helpers.AppLogger.Infof("回滚电视剧 %s 成功", mediaFile.Name)
+	}
+
+	if mediaFile.MediaSeason != nil && mediaFile.MediaSeason.Status != models.MediaStatusUnScraped {
+		if err := t.RollbackTvShowSeason(mediaFile); err != nil {
+			helpers.AppLogger.Errorf("回滚电视剧 %s 季 %d 失败, 失败原因: %v", mediaFile.Name, mediaFile.SeasonNumber, err)
+			return err
+		}
+		helpers.AppLogger.Infof("回滚电视剧 %s 季 %d 成功", mediaFile.Name, mediaFile.SeasonNumber)
+	}
+
+	if mediaFile.MediaEpisode == nil {
+		// 没有集级元数据可回滚，但剧/季可能已处理完，仍然算成功，
+		// 否则这条记录会永远停在 rollbacking 被定时任务反复捞取
+		helpers.AppLogger.Warnf("电视剧 %s 集 %d 缺少集级元数据，跳过集回滚", mediaFile.Name, mediaFile.EpisodeNumber)
+		return nil
+	}
+
+	return t.RollbackEpisode(mediaFile)
 }
 
 // 仅刮削的重新刮削逻辑：将对应刮削记录修改为待刮削

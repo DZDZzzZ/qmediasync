@@ -1,0 +1,38 @@
+FROM qicfan/qms-build-base:latest
+
+ENV TZ=Asia/Shanghai
+ENV PATH=/app:$PATH
+ENV DB_HOST=localhost
+ENV DB_PORT=5432
+ENV DB_USER=qms
+ENV DB_PASSWORD=qms123456
+ENV DB_NAME=qms
+ENV DB_SSLMODE=disable
+
+RUN addgroup -g 12331 qms && \
+    adduser -D -u 12331 -G qms qms
+RUN id qms
+RUN echo 'qms ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+RUN mkdir -p /dev/shm && chmod 1777 /dev/shm
+
+WORKDIR /app
+
+# 二进制已在本地交叉编译好（本机无法访问 Docker Hub，故不在镜像内编译）
+COPY QMediaSync .
+COPY web_statics ./web_statics/
+COPY scripts ./scripts/
+COPY assets/db_config.html ./web_statics/
+COPY icon.ico .
+
+RUN chmod +x /app/scripts/docker-entrypoint.sh
+RUN chmod +x /app/scripts/watch_update.sh
+RUN chmod +x /app/QMediaSync
+RUN chmod 777 /app
+
+VOLUME ["/app/config", "/media"]
+
+EXPOSE 12333
+EXPOSE 8095
+EXPOSE 8094
+
+CMD ["/bin/sh", "-c", "/app/scripts/docker-entrypoint.sh"]

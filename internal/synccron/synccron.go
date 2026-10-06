@@ -215,18 +215,22 @@ func StartScrapeRollbackCron() {
 		limit := 10
 		offset := 0
 		for {
+			// 兜底：把长时间卡在 rollbacking 的记录落到失败态。
+			// 上游剧集回滚实现曾是空壳，导致这类记录被无限重复捞取。
+			// 即使将来再出现同类问题，也不会再形成死循环。
+			models.MarkStuckRollbackRecords(models.RollbackStuckTimeoutSeconds)
 			// 从数据库中获取所有状态为回滚中的记录
 			var mediaFiles []*models.ScrapeMediaFile
 			err := db.Db.Where("status = ?", models.ScrapeMediaStatusRollbacking).Limit(limit).Offset(offset).Find(&mediaFiles).Error
 			if err != nil {
-				helpers.AppLogger.Errorf("获取刮削失败的媒体文件失败: %v", err)
+				helpers.AppLogger.Errorf("获取回滚中的媒体文件失败: %v", err)
 				return
 			}
 			if len(mediaFiles) == 0 {
-				// helpers.AppLogger.Info("没有刮削失败的媒体文件")
+				// helpers.AppLogger.Info("没有回滚中的媒体文件")
 				return
 			}
-			helpers.AppLogger.Infof("获取到 %d 个刮削失败的媒体文件", len(mediaFiles))
+			helpers.AppLogger.Infof("获取到 %d 个回滚中的媒体文件", len(mediaFiles))
 			// 遍历所有媒体文件，进行回滚操作
 			for _, mediaFile := range mediaFiles {
 				scrapePath := models.GetScrapePathByID(mediaFile.ScrapePathId)
@@ -234,6 +238,13 @@ func StartScrapeRollbackCron() {
 				err := scrape.Rollback(mediaFile)
 				if err != nil {
 					helpers.AppLogger.Errorf("回滚媒体文件 %s 失败: %v", mediaFile.Name, err)
+					// 失败后把记录落到 rename_failed 而不是留在 rollbacking，
+					// 否则这条记录会被本任务下一轮无限重复捞取（日志刷屏且永不收敛）
+					mediaFile.Status = models.ScrapeMediaStatusRenameFailed
+					mediaFile.FailedReason = "回滚失败: " + err.Error()
+					if uerr := mediaFile.Save(); uerr != nil {
+						helpers.AppLogger.Errorf("回滚失败后更新记录状态出错 %s: %v", mediaFile.Name, uerr)
+					}
 				} else {
 					helpers.AppLogger.Infof("成功回滚媒体文件 %s", mediaFile.Name)
 				}
