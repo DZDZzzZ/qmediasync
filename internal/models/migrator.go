@@ -18,7 +18,7 @@ type Migrator struct {
 	VersionCode int `json:"version_code"` // 版本号
 }
 
-var MaxVersionCode = 39
+var MaxVersionCode = 41
 var AllTables = []any{
 	BackupConfig{}, BackupRecord{},
 	ApiKey{}, Settings{}, Sync{}, User{}, Account{},
@@ -44,6 +44,8 @@ func Migrate() {
 	if !InitDB() {
 		// 初始化数据库版本表
 		helpers.AppLogger.Info("已完成数据库初始化")
+		// 新建库同样兜底确认一次，防止 BatchCreateTable 中 RSS 表建表被静默跳过
+		EnsureRssAndReplacedKeywordsSchema()
 		return
 	}
 	var migrator Migrator = Migrator{}
@@ -471,12 +473,54 @@ func Migrate() {
 		migrator.UpdateVersionCode(db.Db)
 	}
 	if migrator.VersionCode == 39 {
-		// ScrapePath 增加名称替换规则字段（replaced_keywords），新增 RSS 订阅相关表
-		db.Db.AutoMigrate(ScrapePath{}, RssSubscription{}, RssDownloadRecord{})
 		helpers.AppLogger.Info("已添加名称替换规则字段与RSS订阅表")
 		migrator.UpdateVersionCode(db.Db)
 	}
+	if migrator.VersionCode == 40 {
+		helpers.AppLogger.Info("已确认名称替换规则字段与RSS订阅表存在")
+		migrator.UpdateVersionCode(db.Db)
+	}
+	// 结构兜底：无论数据库停在哪个版本、v39 是否曾静默失败，每次启动都幂等地补齐
+	// scrape_paths.replaced_keywords 列与 RSS 两张表。真正的修复放在这里而不是版本块里，
+	// 这样即便版本号已经被历史 bug 顶到 40/41、版本块不再匹配，也依然能自愈。
+	EnsureRssAndReplacedKeywordsSchema()
 	helpers.AppLogger.Infof("当前数据库版本 %d", migrator.VersionCode)
+}
+
+// EnsureRssAndReplacedKeywordsSchema 幂等地补齐历史迁移可能遗漏的结构：
+//   - scrape_paths.replaced_keywords 列（名称替换规则）
+//   - rss_subscriptions / rss_download_records 表（RSS 订阅）
+//
+// 每一项都单独执行、单独记录错误，任意一项失败都不会阻断其余项。
+//
+// 关键点：绝对不能用 db.Db.AutoMigrate(ScrapePath{}, Rss...) 一次性迁移。
+// GORM 的 AutoMigrate 遇到第一个错误就返回并跳过后续模型；而对已存在的表，
+// 它会用 MigrateColumn 逐列比对并 ALTER，只要 scrape_paths 里某个既有列存在类型漂移
+// 导致 ALTER 失败，整个调用就会中断——结果是 replaced_keywords 加不上、
+// 排在其后的 RSS 两张表也建不出来，且历史代码还忽略了这个错误、版本号照升，
+// 于是每次重启都重复同样的失败。这里改为：
+//   - 列：先 HasColumn 判断，缺失才用 AddColumn 只补这一列，绝不触碰其他既有列；
+//   - 表：RSS 两张表是新增且完全由模型定义、无历史列漂移风险，直接无条件 AutoMigrate
+//     （幂等，并能自动补齐后续给模型新增的列，如 exclude_keywords）。
+func EnsureRssAndReplacedKeywordsSchema() {
+	m := db.Db.Migrator()
+	// scrape_paths 是历史老表：只补 replaced_keywords 这一列，绝不整体 reconcile，
+	// 避免其他既有列的类型漂移触发 ALTER 失败而中断整个迁移（这正是历史 v39 静默失败的根因）。
+	if !m.HasColumn(&ScrapePath{}, "ReplacedKeywords") {
+		if err := m.AddColumn(&ScrapePath{}, "ReplacedKeywords"); err != nil {
+			helpers.AppLogger.Errorf("补齐 scrape_paths.replaced_keywords 列失败: %v", err)
+		} else {
+			helpers.AppLogger.Info("已补齐 scrape_paths.replaced_keywords 列")
+		}
+	}
+	// RSS 两张表是本版本新增、完全由模型定义，没有历史列漂移风险，直接无条件 AutoMigrate：
+	// 幂等，且能自动补齐后续给模型新增的列（例如 exclude_keywords）。分开执行，一张失败不影响另一张。
+	if err := db.Db.AutoMigrate(RssSubscription{}); err != nil {
+		helpers.AppLogger.Errorf("迁移 rss_subscriptions 表失败: %v", err)
+	}
+	if err := db.Db.AutoMigrate(RssDownloadRecord{}); err != nil {
+		helpers.AppLogger.Errorf("迁移 rss_download_records 表失败: %v", err)
+	}
 }
 
 // 重建不存在的表，然后修复主键

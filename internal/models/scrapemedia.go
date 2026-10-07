@@ -971,6 +971,28 @@ func (sm *ScrapeMediaFile) ReScrape(name string, year int, tmdbId int64, season 
 		}
 	}
 	if oldStatus == ScrapeMediaStatusRenamed {
+		// 应用用户修正的季/集编号（与 scraped 分支相同的 TMDB 校验），
+		// 否则回滚后重新刮削仍按旧的季集编号整理
+		if sm.MediaType == MediaTypeTvShow && (season > 0 || episode > 0) {
+			if season > 0 {
+				tvSeason, err := tmdbClient.GetTvSeasonDetail(sm.TmdbId, season, GlobalScrapeSettings.GetTmdbLanguage())
+				if err != nil || tvSeason == nil {
+					serr := fmt.Errorf("查询tmdb剧集 季 %d 查询失败: %v", season, err)
+					helpers.AppLogger.Errorf("%v", serr)
+					return serr
+				}
+				sm.SeasonNumber = season
+			}
+			if episode > 0 {
+				tvEpisode, err := tmdbClient.GetTvEpisodeDetail(sm.TmdbId, sm.SeasonNumber, episode, GlobalScrapeSettings.GetTmdbLanguage())
+				if err != nil || tvEpisode == nil {
+					serr := fmt.Errorf("查询tmdb剧集 季 %d 集 %d 查询失败: %v", sm.SeasonNumber, episode, err)
+					helpers.AppLogger.Errorf("%v", serr)
+					return serr
+				}
+				sm.EpisodeNumber = episode
+			}
+		}
 		// 必须更新 re_scrape_time：MarkStuckRollbackRecords 用它判断回滚是否卡住，
 		// 不更新的话旧时间戳会立刻被兜底判为超时，回滚刚发起就被标记失败
 		sm.Status = ScrapeMediaStatusRollbacking

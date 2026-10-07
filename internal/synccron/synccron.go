@@ -214,6 +214,9 @@ func StartScrapeRollbackCron() {
 	go func() {
 		limit := 10
 		offset := 0
+		// 记录本轮处理过的刮削目录，全部回滚完成后自动触发刮削任务，
+		// 让已重置为待刮削的记录按新识别信息重新整理
+		processedPaths := make(map[uint]*models.ScrapePath)
 		for {
 			// 兜底：把长时间卡在 rollbacking 的记录落到失败态。
 			// 上游剧集回滚实现曾是空壳，导致这类记录被无限重复捞取。
@@ -227,13 +230,41 @@ func StartScrapeRollbackCron() {
 				return
 			}
 			if len(mediaFiles) == 0 {
-				// helpers.AppLogger.Info("没有回滚中的媒体文件")
+				// 全部回滚完成：为受影响的刮削目录排队一次刮削任务，自动按新信息重新刮削整理
+				for _, sp := range processedPaths {
+					taskObj := &NewSyncTask{
+						ID:         sp.ID,
+						TaskType:   SyncTaskTypeScrape,
+						SourceType: sp.SourceType,
+						AccountId:  sp.AccountId,
+					}
+					if aerr := AddNewSyncTask(taskObj); aerr != nil {
+						helpers.AppLogger.Errorf("回滚完成后将刮削任务添加到队列失败: 刮削目录ID=%d %v", sp.ID, aerr)
+					} else {
+						helpers.AppLogger.Infof("回滚全部完成，已自动触发刮削目录 %d 的重新刮削整理任务", sp.ID)
+					}
+				}
 				return
 			}
 			helpers.AppLogger.Infof("获取到 %d 个回滚中的媒体文件", len(mediaFiles))
 			// 遍历所有媒体文件，进行回滚操作
 			for _, mediaFile := range mediaFiles {
 				scrapePath := models.GetScrapePathByID(mediaFile.ScrapePathId)
+				if scrapePath == nil {
+					helpers.AppLogger.Errorf("回滚媒体文件 %s 失败: 找不到刮削目录 ID=%d", mediaFile.Name, mediaFile.ScrapePathId)
+					mediaFile.Status = models.ScrapeMediaStatusRenameFailed
+					mediaFile.FailedReason = "回滚失败: 找不到刮削目录"
+					if uerr := mediaFile.Save(); uerr != nil {
+						helpers.AppLogger.Errorf("回滚失败后更新记录状态出错 %s: %v", mediaFile.Name, uerr)
+					}
+					continue
+				}
+				processedPaths[scrapePath.ID] = scrapePath
+				// 重新读取记录：同批第一条回滚时会批量更新其余记录的 path/tvshow_path 等字段，
+				// 用查询时的旧内存副本会导致后续集搬回已失效的目录ID
+				if fresh := models.GetScrapeMediaFileById(mediaFile.ID); fresh != nil {
+					mediaFile = fresh
+				}
 				scrape := scrape.NewScrape(scrapePath)
 				err := scrape.Rollback(mediaFile)
 				if err != nil {

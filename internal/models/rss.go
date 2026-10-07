@@ -3,20 +3,23 @@ package models
 import (
 	"Q115-STRM/internal/db"
 	"Q115-STRM/internal/helpers"
+	"encoding/json"
 )
 
 // RssSubscription RSS订阅，关联一个刮削目录：
 // 定时检查 RSS 中的新磁力链接 -> 115 离线下载到该刮削目录的来源目录 -> 下载完成后触发该目录的刮削整理
 type RssSubscription struct {
 	BaseModel
-	Name          string `json:"name" form:"name"`                       // 订阅名称，例如 航海王
-	RssUrl        string `json:"rss_url" form:"rss_url"`                 // RSS 地址，例如 https://mikanani.kas.pub/RSS/Bangumi?bangumiId=3015&subgroupid=615
-	ScrapePathId  uint   `json:"scrape_path_id" form:"scrape_path_id"`   // 关联的刮削目录ID，离线文件保存到该目录的来源路径，完成后触发其整理
-	Enabled       bool   `json:"enabled" form:"enabled"`                 // 是否启用
-	CheckInterval int    `json:"check_interval" form:"check_interval"`   // 检查间隔（分钟），默认30，最小5
-	LastCheckAt   int64  `json:"last_check_at" form:"-"`                 // 上次检查时间戳（秒）
-	LastError     string `json:"last_error" form:"-"`                    // 上次检查的错误信息，成功时清空
-	LastItemTitle string `json:"last_item_title" form:"-"`               // 最近一次添加离线下载的条目标题，便于前端展示
+	Name               string   `json:"name" form:"name"`                                     // 订阅名称，例如 航海王
+	RssUrl             string   `json:"rss_url" form:"rss_url"`                               // RSS 地址，例如 https://mikanani.kas.pub/RSS/Bangumi?bangumiId=3015&subgroupid=615
+	ScrapePathId       uint     `json:"scrape_path_id" form:"scrape_path_id"`                 // 关联的刮削目录ID，离线文件保存到该目录的来源路径，完成后触发其整理
+	Enabled            bool     `json:"enabled" form:"enabled"`                               // 是否启用
+	CheckInterval      int      `json:"check_interval" form:"check_interval"`                 // 检查间隔（分钟），默认30，最小5
+	ExcludeKeywords    string   `json:"-" form:"-"`                                           // 排除关键词，json字符串数组；条目标题命中任意一个即跳过（如【繁体】）
+	ExcludeKeywordList []string `json:"exclude_keyword_list" form:"exclude_keyword_list" gorm:"-"` // 排除关键词列表（前端交互用，持久化进 ExcludeKeywords）
+	LastCheckAt        int64    `json:"last_check_at" form:"-"`                               // 上次检查时间戳（秒）
+	LastError          string   `json:"last_error" form:"-"`                                  // 上次检查的错误信息，成功时清空
+	LastItemTitle      string   `json:"last_item_title" form:"-"`                             // 最近一次添加离线下载的条目标题，便于前端展示
 }
 
 // RSS 下载记录的状态
@@ -46,19 +49,64 @@ func (r *RssSubscription) Save() error {
 	if r.CheckInterval < 5 {
 		r.CheckInterval = 30
 	}
+	// 序列化排除关键词列表为 json 字符串持久化
+	if len(r.ExcludeKeywordList) > 0 {
+		kws, err := json.Marshal(r.ExcludeKeywordList)
+		if err != nil {
+			helpers.AppLogger.Errorf("转换RSS排除关键词失败: %v", err)
+			return err
+		}
+		r.ExcludeKeywords = string(kws)
+	} else {
+		r.ExcludeKeywords = ""
+	}
 	if r.ID == 0 {
 		return db.Db.Create(r).Error
 	}
 	return db.Db.Model(r).Updates(map[string]any{
-		"name":            r.Name,
-		"rss_url":         r.RssUrl,
-		"scrape_path_id":  r.ScrapePathId,
-		"enabled":         r.Enabled,
-		"check_interval":  r.CheckInterval,
-		"last_check_at":   r.LastCheckAt,
-		"last_error":      r.LastError,
-		"last_item_title": r.LastItemTitle,
+		"name":             r.Name,
+		"rss_url":          r.RssUrl,
+		"scrape_path_id":   r.ScrapePathId,
+		"enabled":          r.Enabled,
+		"check_interval":   r.CheckInterval,
+		"exclude_keywords": r.ExcludeKeywords,
+		"last_check_at":    r.LastCheckAt,
+		"last_error":       r.LastError,
+		"last_item_title":  r.LastItemTitle,
 	}).Error
+}
+
+// Decode 把持久化的 json 字符串字段反序列化到交互用切片字段。
+// 从数据库读出的订阅在返回前都应调用，否则 CheckRssSubscription 里的 defer sub.Save()
+// 会因为 ExcludeKeywordList 为空而把 exclude_keywords 覆盖清空。
+func (r *RssSubscription) Decode() {
+	if r.ExcludeKeywords != "" {
+		var kws []string
+		if err := json.Unmarshal([]byte(r.ExcludeKeywords), &kws); err != nil {
+			helpers.AppLogger.Errorf("解析RSS排除关键词失败: %v", err)
+		} else {
+			r.ExcludeKeywordList = kws
+		}
+	}
+	if r.ExcludeKeywordList == nil {
+		r.ExcludeKeywordList = []string{}
+	}
+}
+
+// GetExcludeKeywords 返回排除关键词列表（优先用已解码切片，否则从 json 字符串解析）
+func (r *RssSubscription) GetExcludeKeywords() []string {
+	if len(r.ExcludeKeywordList) > 0 {
+		return r.ExcludeKeywordList
+	}
+	if r.ExcludeKeywords == "" {
+		return nil
+	}
+	var kws []string
+	if err := json.Unmarshal([]byte(r.ExcludeKeywords), &kws); err != nil {
+		helpers.AppLogger.Errorf("解析RSS排除关键词失败: %v", err)
+		return nil
+	}
+	return kws
 }
 
 func (r *RssSubscription) Delete() error {
@@ -74,6 +122,9 @@ func GetRssSubscriptions() []*RssSubscription {
 	if err := db.Db.Model(&RssSubscription{}).Order("id DESC").Find(&subs).Error; err != nil {
 		helpers.AppLogger.Errorf("获取RSS订阅列表失败: %v", err)
 	}
+	for _, s := range subs {
+		s.Decode()
+	}
 	return subs
 }
 
@@ -82,6 +133,7 @@ func GetRssSubscriptionByID(id uint) *RssSubscription {
 	if err := db.Db.Model(&RssSubscription{}).Where("id = ?", id).First(&sub).Error; err != nil {
 		return nil
 	}
+	sub.Decode()
 	return &sub
 }
 
@@ -90,6 +142,9 @@ func GetEnabledRssSubscriptions() []*RssSubscription {
 	var subs []*RssSubscription
 	if err := db.Db.Model(&RssSubscription{}).Where("enabled = ?", true).Find(&subs).Error; err != nil {
 		helpers.AppLogger.Errorf("获取启用的RSS订阅失败: %v", err)
+	}
+	for _, s := range subs {
+		s.Decode()
 	}
 	return subs
 }

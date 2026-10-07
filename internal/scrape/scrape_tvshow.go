@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -705,10 +706,169 @@ func (t *tvShowScrapeImpl) Rollback(mediaFile *models.ScrapeMediaFile) error {
 		// 没有集级元数据可回滚，但剧/季可能已处理完，仍然算成功，
 		// 否则这条记录会永远停在 rollbacking 被定时任务反复捞取
 		helpers.AppLogger.Warnf("电视剧 %s 集 %d 缺少集级元数据，跳过集回滚", mediaFile.Name, mediaFile.EpisodeNumber)
-		return nil
+	} else if err := t.RollbackEpisode(mediaFile); err != nil {
+		helpers.AppLogger.Errorf("回滚电视剧 %s 季 %d 集 %d 失败, 失败原因: %v", mediaFile.Name, mediaFile.SeasonNumber, mediaFile.EpisodeNumber, err)
+		return err
 	}
 
-	return t.RollbackEpisode(mediaFile)
+	// 整批回滚完成后收敛：把同批记录重置回待刮削，刮削任务会自动按新识别信息重新整理。
+	// 没有这一步的话记录会永远停在 rollbacking，被回滚定时任务反复捞取，
+	// 30 分钟后被兜底误判为"回滚超时失败"。
+	t.finishBatchRollback(mediaFile)
+	return nil
+}
+
+// 检查同批次（同剧目录 + batch_no）是否还有回滚中的记录；
+// 当前记录是最后一条时，把整批记录重置为待刮削（scanned），并删除旧的 Media/MediaSeason/MediaEpisode 行。
+// 保留 ReScrape 写入的新识别信息（name/year/tmdb_id/季集编号）和 is_re_scrape/re_scrape_time，
+// 下次刮削任务运行时 Identify 会直接使用新的 TMDB ID 重新刮削、重新整理。
+func (t *tvShowScrapeImpl) finishBatchRollback(mediaFile *models.ScrapeMediaFile) {
+	// 批次条件与 ReScrape 保持一致：优先 tvshow_path_id，115 无剧目录 ID 时退回 path_id
+	batchCond := "tvshow_path_id = ? AND batch_no = ?"
+	batchArg := any(mediaFile.TvshowPathId)
+	if mediaFile.TvshowPathId == "" {
+		batchCond = "path_id = ? AND batch_no = ?"
+		batchArg = any(mediaFile.PathId)
+	}
+	var remaining int64
+	if err := db.Db.Model(&models.ScrapeMediaFile{}).
+		Where(batchCond+" AND status = ? AND id != ?", batchArg, mediaFile.BatchNo, models.ScrapeMediaStatusRollbacking, mediaFile.ID).
+		Count(&remaining).Error; err != nil {
+		helpers.AppLogger.Errorf("查询同批次剩余回滚中记录失败: %v", err)
+		return
+	}
+	if remaining > 0 {
+		// 同批还有记录没回滚完，由最后一条触发收敛
+		return
+	}
+
+	// 收集整批记录引用的旧元数据行 ID
+	var batchFiles []*models.ScrapeMediaFile
+	if err := db.Db.Where(batchCond+" AND status = ?", batchArg, mediaFile.BatchNo, models.ScrapeMediaStatusRollbacking).Find(&batchFiles).Error; err != nil {
+		helpers.AppLogger.Errorf("查询同批次回滚中的记录失败: %v", err)
+		return
+	}
+	mediaIds := make(map[uint]bool)
+	seasonIds := make(map[uint]bool)
+	episodeIds := make(map[uint]bool)
+	for _, f := range batchFiles {
+		if f.MediaId != 0 {
+			mediaIds[f.MediaId] = true
+		}
+		if f.MediaSeasonId != 0 {
+			seasonIds[f.MediaSeasonId] = true
+		}
+		if f.MediaEpisodeId != 0 {
+			episodeIds[f.MediaEpisodeId] = true
+		}
+	}
+
+	// 清理按旧识别结果整理出的目标目录（此时集文件已搬回，目录里只剩剧/季级元数据）。
+	// 必须在重置派生字段之前调用：清理依赖 batchFiles 里仍保留的 NewPathId/NewSeasonPathName 等旧值
+	t.cleanupOldTargetDirs(batchFiles)
+
+	// 重置为待刮削，清空按旧识别结果计算的派生字段（与 ReScrape 的重置分支一致）
+	updateData := map[string]interface{}{
+		"status":                  models.ScrapeMediaStatusScanned,
+		"media_id":                0,
+		"media_season_id":         0,
+		"media_episode_id":        0,
+		"failed_reason":           "",
+		"category_name":           "",
+		"scrape_path_category_id": 0,
+		"new_path_name":           "",
+		"new_season_path_name":    "",
+		"new_path_id":             "",
+		"new_season_path_id":      "",
+		"new_video_base_name":     "",
+	}
+	res := db.Db.Model(&models.ScrapeMediaFile{}).
+		Where(batchCond+" AND status = ?", batchArg, mediaFile.BatchNo, models.ScrapeMediaStatusRollbacking).
+		Updates(updateData)
+	if res.Error != nil {
+		helpers.AppLogger.Errorf("回滚完成后重置批次记录为待刮削失败: %v", res.Error)
+		return
+	}
+	for id := range mediaIds {
+		db.Db.Delete(&models.Media{}, id)
+	}
+	for id := range seasonIds {
+		db.Db.Delete(&models.MediaSeason{}, id)
+	}
+	for id := range episodeIds {
+		db.Db.Delete(&models.MediaEpisode{}, id)
+	}
+	helpers.AppLogger.Infof("电视剧 %s 批次 %s 回滚全部完成，%d 条记录已重置为待刮削，将按新的识别信息自动重新刮削整理",
+		mediaFile.Name, mediaFile.BatchNo, res.RowsAffected)
+}
+
+// 清理按旧识别结果整理出的目标目录（剧目录和季目录）。
+// 安全约束：
+//   - 仅刮削模式下目标目录就是源目录，绝不清理
+//   - 目录仍被其他批次记录引用（如同一剧的其他季）时跳过，避免误删别的批次的文件
+//   - 目录是（或包含）来源根目录时跳过，防止误删源
+func (t *tvShowScrapeImpl) cleanupOldTargetDirs(batchFiles []*models.ScrapeMediaFile) {
+	seasonDirs := make(map[string]string) // 目录ID => 完整路径
+	showDirs := make(map[string]string)
+	sourcePaths := make([]string, 0)
+	for _, f := range batchFiles {
+		if f.ScrapeType == models.ScrapeTypeOnly {
+			// 仅刮削模式目标目录即源目录，不能删
+			return
+		}
+		if f.NewSeasonPathId != "" {
+			seasonDirs[f.NewSeasonPathId] = f.GetDestFullSeasonPath()
+		}
+		if f.NewPathId != "" {
+			showDirs[f.NewPathId] = f.GetDestFullTvshowPath()
+		}
+		if f.SourcePath != "" {
+			sourcePaths = append(sourcePaths, f.SourcePath)
+		}
+	}
+	// 目标目录如果等于来源根目录、或来源根目录在其内部，则不能删
+	unsafe := func(dirPath string) bool {
+		for _, sp := range sourcePaths {
+			if sp == dirPath || strings.HasPrefix(sp, dirPath+string(filepath.Separator)) || strings.HasPrefix(sp, dirPath+"/") {
+				return true
+			}
+		}
+		return false
+	}
+	for id, path := range seasonDirs {
+		if path == "" || unsafe(path) {
+			helpers.AppLogger.Warnf("旧目标季目录 %s 命中来源目录保护，跳过清理", path)
+			continue
+		}
+		var inUse int64
+		db.Db.Model(&models.ScrapeMediaFile{}).Where("new_season_path_id = ? AND batch_no != ?", id, batchFiles[0].BatchNo).Count(&inUse)
+		if inUse > 0 {
+			helpers.AppLogger.Infof("旧目标季目录 %s 仍被其他批次使用，跳过清理", path)
+			continue
+		}
+		if err := t.renameImpl.DeleteDir(path, id); err != nil {
+			helpers.AppLogger.Errorf("清理旧目标季目录 %s 失败: %v", path, err)
+		} else {
+			helpers.AppLogger.Infof("已清理旧目标季目录 %s", path)
+		}
+	}
+	for id, path := range showDirs {
+		if path == "" || unsafe(path) {
+			helpers.AppLogger.Warnf("旧目标剧目录 %s 命中来源目录保护，跳过清理", path)
+			continue
+		}
+		var inUse int64
+		db.Db.Model(&models.ScrapeMediaFile{}).Where("new_path_id = ? AND batch_no != ?", id, batchFiles[0].BatchNo).Count(&inUse)
+		if inUse > 0 {
+			helpers.AppLogger.Infof("旧目标剧目录 %s 仍被其他批次使用，跳过清理", path)
+			continue
+		}
+		if err := t.renameImpl.DeleteDir(path, id); err != nil {
+			helpers.AppLogger.Errorf("清理旧目标剧目录 %s 失败: %v", path, err)
+		} else {
+			helpers.AppLogger.Infof("已清理旧目标剧目录 %s", path)
+		}
+	}
 }
 
 // 仅刮削的重新刮削逻辑：将对应刮削记录修改为待刮削

@@ -16,4 +16,4 @@ COPY scripts /app/scripts
 RUN chmod +x /app/scripts/*.sh 2>/dev/null || true
 
 LABEL org.opencontainers.image.title="QMediaSync (dzdzzz build)"
-LABEL org.opencontainers.image.version="v0.14.23-dzdzzz-v5"
+LABEL org.opencontainers.image.version="v0.14.23-dzdzzz-v6"

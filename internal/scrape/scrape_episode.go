@@ -1,6 +1,7 @@
 package scrape
 
 import (
+	"Q115-STRM/internal/db"
 	"Q115-STRM/internal/helpers"
 	"Q115-STRM/internal/models"
 	"Q115-STRM/internal/notificationmanager"
@@ -9,6 +10,7 @@ import (
 	"Q115-STRM/internal/v115open"
 	ws "Q115-STRM/internal/websocket"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -438,6 +440,118 @@ func (t *tvShowScrapeImpl) UploadEpisodeScrapeFile(mediaFile *models.ScrapeMedia
 	return nil
 }
 
+// 回滚单集：
+// 1. 删除按旧识别结果上传的集元数据（nfo/海报）
+// 2. 刮削+整理/仅整理模式下，把视频和字幕从目标季目录移回（已恢复的）源目录并改回原文件名
+// 3. 删除 MediaEpisode 元数据行
+// 注意：上游此函数曾是空壳（return nil），导致集级文件从未被搬回、记录永远停在 rollbacking。
 func (t *tvShowScrapeImpl) RollbackEpisode(mediaFile *models.ScrapeMediaFile) error {
+	// 删除按旧识别结果生成的集元数据文件（必须在清空 NewVideoBaseName 等派生字段之前做）
+	uploadFiles := t.GetEpisodeUploadFiles(mediaFile)
+	metaFiles := make([]models.WillDeleteFile, 0)
+	for _, uf := range uploadFiles {
+		metaFiles = append(metaFiles, models.WillDeleteFile{FullFilePath: filepath.Join(uf.DestPath, uf.FileName)})
+	}
+	if err := t.renameImpl.CheckAndDeleteFiles(mediaFile, metaFiles); err != nil {
+		helpers.AppLogger.Errorf("删除集元数据文件失败: %v", err)
+		return err
+	}
+
+	// 仅刮削模式没有移动过文件，无需搬回
+	if mediaFile.ScrapeType == models.ScrapeTypeScrapeAndRename || mediaFile.ScrapeType == models.ScrapeTypeOnlyRename {
+		// 搬回目标：RollbackTvShow/RollbackTvShowSeason 恢复后的源季目录；没有独立季目录时退回剧目录
+		destPathId := mediaFile.PathId
+		destPath := mediaFile.Path
+		if destPathId == "" || destPath == "" {
+			destPathId = mediaFile.TvshowPathId
+			destPath = mediaFile.TvshowPath
+		}
+		if destPathId == "" || destPath == "" {
+			return errors.New("源目录信息缺失，无法回滚集文件")
+		}
+		oldBaseName := strings.TrimSuffix(mediaFile.VideoFilename, mediaFile.VideoExt)
+
+		// ---- 视频文件 ----
+		// 115: 移动不改 fid，VideoFileId 仍然有效；本地等: 整理后 MediaEpisode.VideoFileId 被更新为目标目录完整路径
+		videoFileId := mediaFile.VideoFileId
+		if mediaFile.SourceType != models.SourceType115 && mediaFile.MediaEpisode != nil && mediaFile.MediaEpisode.VideoFileId != "" {
+			videoFileId = mediaFile.MediaEpisode.VideoFileId
+		}
+		if videoFileId == "" {
+			return errors.New("视频文件ID为空，无法回滚集文件")
+		}
+		moveFile := models.MoveNewFileToSourceFile{
+			FileId:       videoFileId,
+			FileFullPath: filepath.Join(destPath, mediaFile.VideoFilename),
+			PathId:       destPathId,
+		}
+		if merr := t.renameImpl.MoveFiles(moveFile); merr != nil {
+			helpers.AppLogger.Errorf("回滚时移动视频文件回源目录失败: %v", merr)
+			return merr
+		}
+		// 改回原文件名（115 用 fid 改名；本地移动后文件位于 destPathId/原base名，用完整路径改名）
+		renameId := videoFileId
+		if mediaFile.SourceType != models.SourceType115 {
+			renameId = filepath.Join(destPathId, filepath.Base(videoFileId))
+		}
+		if rerr := t.renameImpl.Rename(renameId, mediaFile.VideoFilename); rerr != nil {
+			helpers.AppLogger.Errorf("回滚时恢复视频文件原名失败: %v", rerr)
+		}
+
+		// ---- 字幕文件 ----
+		type subRollback struct {
+			fileId   string
+			origName string
+		}
+		subs := make([]subRollback, 0)
+		if mediaFile.SourceType != models.SourceType115 && mediaFile.MediaEpisode != nil && len(mediaFile.MediaEpisode.SubtitleFiles) > 0 {
+			// 本地: MediaEpisode.SubtitleFiles 记录了整理后的当前完整路径，原名按 NewVideoBaseName 反推
+			for _, s := range mediaFile.MediaEpisode.SubtitleFiles {
+				origName := s.FileName
+				if mediaFile.NewVideoBaseName != "" && mediaFile.NewVideoBaseName != oldBaseName {
+					origName = strings.Replace(s.FileName, mediaFile.NewVideoBaseName, oldBaseName, 1)
+				}
+				subs = append(subs, subRollback{fileId: s.FileId, origName: origName})
+			}
+		} else {
+			// 115: 移动/改名都不改 fid，记录里的 SubtitleFiles 仍保存原始 fid 和原始文件名
+			for _, s := range mediaFile.SubtitleFiles {
+				subs = append(subs, subRollback{fileId: s.FileId, origName: s.FileName})
+			}
+		}
+		for _, s := range subs {
+			if s.fileId == "" {
+				continue
+			}
+			subMove := models.MoveNewFileToSourceFile{
+				FileId:       s.fileId,
+				FileFullPath: filepath.Join(destPath, s.origName),
+				PathId:       destPathId,
+			}
+			if merr := t.renameImpl.MoveFiles(subMove); merr != nil {
+				helpers.AppLogger.Errorf("回滚时移动字幕文件 %s 失败: %v", s.origName, merr)
+				continue
+			}
+			subRenameId := s.fileId
+			if mediaFile.SourceType != models.SourceType115 {
+				subRenameId = filepath.Join(destPathId, filepath.Base(s.fileId))
+			}
+			if rerr := t.renameImpl.Rename(subRenameId, s.origName); rerr != nil {
+				helpers.AppLogger.Errorf("回滚时恢复字幕文件 %s 原名失败: %v", s.origName, rerr)
+			}
+		}
+		helpers.AppLogger.Infof("回滚电视剧 %s 季 %d 集 %d 成功，文件已移回 %s", mediaFile.Name, mediaFile.SeasonNumber, mediaFile.EpisodeNumber, destPath)
+	} else {
+		helpers.AppLogger.Infof("回滚电视剧 %s 季 %d 集 %d 成功，已删除旧元数据", mediaFile.Name, mediaFile.SeasonNumber, mediaFile.EpisodeNumber)
+	}
+
+	// 删除集元数据行，重新刮削时会按新的识别信息重建
+	if mediaFile.MediaEpisodeId != 0 {
+		if derr := db.Db.Delete(&models.MediaEpisode{}, mediaFile.MediaEpisodeId).Error; derr != nil {
+			helpers.AppLogger.Errorf("删除集元数据记录失败: id=%d %v", mediaFile.MediaEpisodeId, derr)
+		}
+		mediaFile.MediaEpisodeId = 0
+		mediaFile.MediaEpisode = nil
+	}
 	return nil
 }

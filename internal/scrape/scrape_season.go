@@ -276,8 +276,8 @@ func (t *tvShowScrapeImpl) RollbackTvShowSeason(mediaFile *models.ScrapeMediaFil
 		}
 		helpers.AppLogger.Infof("删除已上传的元数据文件成功: %v", files)
 	}
-	// 如果是刮削和整理或者仅整理
-	if mediaFile.ScrapeType == models.ScrapeTypeScrapeAndRename || mediaFile.ScrapeType == models.ScrapeTypeOnlyRename && mediaFile.Path != "" {
+	// 如果是刮削和整理或者仅整理（原条件 A || B && C 存在优先级问题：ScrapeAndRename 时不会检查 Path 为空）
+	if (mediaFile.ScrapeType == models.ScrapeTypeScrapeAndRename || mediaFile.ScrapeType == models.ScrapeTypeOnlyRename) && mediaFile.Path != "" {
 		// 检查目录是否存在，如果存在则改名字，如果不存在则创建
 		parentPath := filepath.Dir(mediaFile.Path)
 		var newPath string
