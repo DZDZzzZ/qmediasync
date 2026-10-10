@@ -253,8 +253,8 @@ videoloop:
 
 func (m *scanBaseImpl) ExtractSeasonEpisode(mediaFile *models.ScrapeMediaFile) error {
 	if mediaFile.EpisodeNumber == -1 {
-		// 先识别季集
-		info := helpers.ExtractMediaInfoRe(mediaFile.VideoFilename, false, true, m.scrapePath.VideoExtList, m.scrapePath.DeleteKeyword...)
+		// 先识别季集。必须先应用名称替换规则，替换后注入的 Sxx 才能被季号解析识别
+		info := helpers.ExtractMediaInfoRe(m.scrapePath.ApplyReplaceKeywords(mediaFile.VideoFilename), false, true, m.scrapePath.VideoExtList, m.scrapePath.DeleteKeyword...)
 		if info == nil {
 			helpers.AppLogger.Errorf("使用正则从文件名中提取媒体信息失败，文件名 %s", mediaFile.VideoFilename)
 			return errors.New("使用正则从文件名中提取媒体信息失败")

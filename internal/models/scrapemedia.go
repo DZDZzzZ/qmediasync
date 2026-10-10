@@ -1081,8 +1081,8 @@ func MarkStuckRollbackRecords(timeoutSeconds int64) {
 
 func (sm *ScrapeMediaFile) ExtractSeasonEpisode(sp *ScrapePath) error {
 	if sm.EpisodeNumber == -1 {
-		// 先识别季集
-		info := helpers.ExtractMediaInfoRe(sm.VideoFilename, false, true, sp.VideoExtList, sp.DeleteKeyword...)
+		// 先识别季集。必须先应用名称替换规则，替换后注入的 Sxx 才能被季号解析识别
+		info := helpers.ExtractMediaInfoRe(sp.ApplyReplaceKeywords(sm.VideoFilename), false, true, sp.VideoExtList, sp.DeleteKeyword...)
 		if info == nil {
 			helpers.AppLogger.Errorf("使用正则从文件名中提取媒体信息失败，文件名 %s", sm.VideoFilename)
 			return errors.New("使用正则从文件名中提取媒体信息失败")

@@ -303,39 +303,75 @@ func PreProcess(name string, excludePatterns ...string) string {
 	return strings.TrimSpace(name)
 }
 
-// ExtractSeasonEpisode 提取季和集信息
+// tmdbIdMarkerRe 匹配 {tmdbid-37854} / [tmdb-123] / 【tmdbid-456】 这类标记。
+// 季集解析前必须先剥掉，否则里面的数字会被集号兜底正则 (\d{2,4}) 误抓（例如 37854 被抓成集号 3785）。
+var tmdbIdMarkerRe = regexp.MustCompile(`(?i)[\{\[【]\s*tmdb(?:id)?-\d+\s*[\}\]】]`)
+
+// ExtractSeasonEpisode 提取季和集信息。
+// 分三个阶段：①季+集连写（SxxExx / Season X Episode Y / NxNN / 第x季第x集）；
+// ②独立季号（S23 / 第3季 / Season 3）——很多长篇动画（如海贼王）文件名里季和集是分开的，
+//   或由名称替换规则注入 Sxx，必须单独识别，否则会被集号兜底正则误当成集号；
+// ③集号。集号统一放宽到 4 位，支持超过 999 集的长篇动画。
 func ExtractSeasonEpisode(name string) (string, int, int) {
 	// fmt.Printf("提取季集前文件名: %s\n", name)
-	patterns := []string{
-		`(?i)S(\d{1,2})E[P]?(\d{1,3})`,         // S01E01 或者S01EP01
-		`(?i)E[P]?(\d{1,3})`,                   // E01 或者 EP01
-		`(?i)Season\s*(\d+)\s*Episode\s*(\d+)`, // Season 1 Episode 1
-		`(?i)(\d{1,2})x(\d{1,3})`,              // 1x01
-		`第\s*(\d+)\s*季.*第\s*(\d+)\s*集`,         // 中文格式：第 1 季第 1 集或第1季第1集
-		`第\s*(\d+)\s*集`,                        // 中文格式：第 1 集或第1集
-		`(?i)Vol[\.|\s]+(\d+)`,                 // 卷号
-		`\s?(\d{1,3})$`,                        // 只有集，凡人修仙传 10.mp4或10.mp4
-		`\-\s(\d{1,3})\s`,                      // 只有集，- 10 xxxx.mp4
-		`(\d{2,4})[\s|\.|\_|\-]4[K|k]`,         // 01 4K或01_4K或01-4K或01.4K
-		`\[(\d{1,3})\]`,                        // [01]这种格式
-		`(\d{2,4})`,                            // 10.mkv这种格式
-	}
 	seasonNumber := -1
 	episodeNumber := -1
-	for _, pattern := range patterns {
+
+	// 先剥掉 {tmdbid-xxx} 标记，避免其数字污染后面的季/集识别
+	name = tmdbIdMarkerRe.ReplaceAllString(name, " ")
+
+	// 阶段①：季+集 连写（能同时确定季和集，优先级最高）
+	bothPatterns := []string{
+		`(?i)S(\d{1,2})E[P]?(\d{1,4})`,         // S01E01 / S01EP01
+		`(?i)Season\s*(\d+)\s*Episode\s*(\d+)`, // Season 1 Episode 1
+		`(?i)(\d{1,2})x(\d{1,4})`,              // 1x01
+		`第\s*(\d+)\s*季.*第\s*(\d+)\s*集`,         // 第1季第1集
+	}
+	for _, pattern := range bothPatterns {
 		re := regexp.MustCompile(pattern)
-		matches := re.FindStringSubmatch(name)
-		// fmt.Printf("识别结果数量%d, 结果:%+v\n", len(matches), matches)
-		if len(matches) > 2 {
-			fmt.Sscanf(matches[1], "%d", &seasonNumber)
-			fmt.Sscanf(matches[2], "%d", &episodeNumber)
-			name = strings.Replace(name, matches[0], " ", 1)
+		if m := re.FindStringSubmatch(name); len(m) > 2 {
+			fmt.Sscanf(m[1], "%d", &seasonNumber)
+			fmt.Sscanf(m[2], "%d", &episodeNumber)
+			name = strings.Replace(name, m[0], " ", 1)
+			return name, seasonNumber, episodeNumber
+		}
+	}
+
+	// 阶段②：独立季号。用 \b 词边界确保不会切到 SxxExx 里的 S（RE2 不支持先行断言）。
+	// 命中后立即从 name 移除该片段，防止阶段③的集号兜底正则把季号数字当成集号。
+	seasonOnlyPatterns := []string{
+		`(?i)\bS(\d{1,2})\b`,     // S23
+		`第\s*(\d+)\s*季`,          // 第3季
+		`(?i)\bSeason\s*(\d+)\b`, // Season 3
+	}
+	for _, pattern := range seasonOnlyPatterns {
+		re := regexp.MustCompile(pattern)
+		if m := re.FindStringSubmatch(name); len(m) == 2 {
+			var s int
+			if _, err := fmt.Sscanf(m[1], "%d", &s); err == nil && s > 0 {
+				seasonNumber = s
+				name = strings.Replace(name, m[0], " ", 1)
+			}
 			break
 		}
-		if len(matches) == 2 {
-			fmt.Sscanf(matches[1], "%d", &episodeNumber)
-			// fmt.Printf("识别到集数:%d\n", episodeNumber)
-			name = strings.Replace(name, matches[0], " ", 1)
+	}
+
+	// 阶段③：集号（保持原有相对顺序，仅把集号位数放宽到 4 位）
+	episodePatterns := []string{
+		`(?i)E[P]?(\d{1,4})`,            // E01 / EP01
+		`第\s*(\d+)\s*集`,                 // 第1集
+		`(?i)Vol[\.|\s]+(\d+)`,          // 卷号
+		`\s?(\d{1,4})$`,                 // 结尾数字：凡人修仙传 10.mp4
+		`\-\s(\d{1,4})\s`,               // - 10 xxxx.mp4
+		`(\d{2,4})[\s|\.|\_|\-]4[K|k]`,  // 01 4K
+		`\[(\d{1,4})\]`,                 // [1160]
+		`(\d{2,4})`,                     // 兜底：10.mkv
+	}
+	for _, pattern := range episodePatterns {
+		re := regexp.MustCompile(pattern)
+		if m := re.FindStringSubmatch(name); len(m) == 2 {
+			fmt.Sscanf(m[1], "%d", &episodeNumber)
+			name = strings.Replace(name, m[0], " ", 1)
 			break
 		}
 	}
